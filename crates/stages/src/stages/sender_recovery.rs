@@ -13,7 +13,7 @@ use reth_primitives::{
     stage::{StageCheckpoint, StageId},
     SealedHeader, TransactionSignedNoHash, TxNumber, H160,
 };
-use reth_provider::{providers::read_sealed_header, Transaction};
+use reth_provider::{ProviderError, Transaction};
 use std::fmt::Debug;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -154,20 +154,21 @@ impl<DB: Database> Stage<DB> for SenderRecoveryStage {
                         // TODO: remove expect
                         let block_number =
                             match tx_block_cursor.seek(err.tx).map(|b| b.map(|(_, bn)| bn)) {
-                                Ok(num) => num,
+                                Ok(Some(num)) => num,
+                                Ok(None) => {
+                                    return ProviderError::BlockNumberForTransactionIndexNotFound
+                                        .into()
+                                }
                                 Err(e) => return e.into(),
-                            }
-                            .expect("tx to be in block");
+                            };
 
                         // fetch the sealed header so we can use it in the sender recovery unwind
-                        // TODO: remove expect
-                        let (header, block_hash) = match read_sealed_header(&**tx, block_number) {
+                        let sealed_header = match tx.get_sealed_header(block_number) {
                             Ok(header_hash) => header_hash,
                             Err(e) => return e.into(),
-                        }
-                        .expect("header to exist for block number");
+                        };
 
-                        FailedSenderRecoveryError::with_block(header.seal(block_hash))
+                        FailedSenderRecoveryError::with_block(sealed_header)
                     }
                     SenderRecoveryStageError::StageError(err) => err,
                 })?;
