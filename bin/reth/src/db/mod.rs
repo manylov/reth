@@ -100,7 +100,7 @@ impl Command {
             reth_db::mdbx::EnvKind::RW,
         )?;
 
-        let mut tool = DbTool::new(&db)?;
+        let mut tool = DbTool::new(&db, self.chain.clone())?;
 
         match self.command {
             // TODO: We'll need to add this on the DB trait.
@@ -117,7 +117,10 @@ impl Command {
                 ]);
 
                 tool.db.view(|tx| {
-                    for table in tables::TABLES.iter().map(|(_, name)| name) {
+                    let mut tables =
+                        tables::TABLES.iter().map(|(_, name)| name).collect::<Vec<_>>();
+                    tables.sort();
+                    for table in tables {
                         let table_db =
                             tx.inner.open_db(Some(table)).wrap_err("Could not open db.")?;
 

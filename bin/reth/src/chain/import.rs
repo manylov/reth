@@ -174,11 +174,10 @@ impl ImportCommand {
                     ExecutionStageThresholds {
                         max_blocks: config.stages.execution.max_blocks,
                         max_changes: config.stages.execution.max_changes,
-                        max_changesets: config.stages.execution.max_changesets,
                     },
                 )),
             )
-            .build(db);
+            .build(db, self.chain.clone());
 
         let events = pipeline.events().map(Into::into);
 

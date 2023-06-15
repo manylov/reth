@@ -46,7 +46,7 @@ use reth_primitives::{
 };
 use reth_provider::{
     providers::get_stage_checkpoint, BlockProvider, CanonStateSubscriptions, HeaderProvider,
-    ShareableDatabase,
+    ProviderFactory,
 };
 use reth_revm::Factory;
 use reth_revm_inspectors::stack::Hook;
@@ -80,9 +80,7 @@ use crate::{
 };
 use reth_interfaces::p2p::headers::client::HeadersClient;
 use reth_payload_builder::PayloadBuilderService;
-use reth_primitives::bytes::BytesMut;
 use reth_provider::providers::BlockchainProvider;
-use reth_rlp::Encodable;
 
 pub mod cl_events;
 pub mod events;
@@ -201,8 +199,8 @@ impl Command {
         )?);
 
         // setup the blockchain provider
-        let shareable_db = ShareableDatabase::new(Arc::clone(&db), Arc::clone(&self.chain));
-        let blockchain_db = BlockchainProvider::new(shareable_db, blockchain_tree.clone())?;
+        let factory = ProviderFactory::new(Arc::clone(&db), Arc::clone(&self.chain));
+        let blockchain_db = BlockchainProvider::new(factory, blockchain_tree.clone())?;
 
         let transaction_pool = reth_transaction_pool::Pool::eth_pool(
             EthTransactionValidator::new(blockchain_db.clone(), Arc::clone(&self.chain)),
@@ -256,9 +254,6 @@ impl Command {
 
         let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
 
-        // configure the payload builder
-        let mut extradata = BytesMut::new();
-        self.builder.extradata.as_bytes().encode(&mut extradata);
         let payload_generator = BasicPayloadJobGenerator::new(
             blockchain_db.clone(),
             transaction_pool.clone(),
@@ -267,7 +262,7 @@ impl Command {
                 .interval(self.builder.interval)
                 .deadline(self.builder.deadline)
                 .max_payload_tasks(self.builder.max_payload_tasks)
-                .extradata(extradata.freeze())
+                .extradata(self.builder.extradata_bytes())
                 .max_gas_limit(self.builder.max_gas_limit),
             Arc::clone(&self.chain),
         );
@@ -605,7 +600,7 @@ impl Command {
         executor: TaskExecutor,
         secret_key: SecretKey,
         default_peers_path: PathBuf,
-    ) -> NetworkConfig<ShareableDatabase<Arc<Env<WriteMap>>>> {
+    ) -> NetworkConfig<ProviderFactory<Arc<Env<WriteMap>>>> {
         let head = self.lookup_head(Arc::clone(&db)).expect("the head block is missing");
 
         self.network
@@ -620,7 +615,7 @@ impl Command {
                 Ipv4Addr::UNSPECIFIED,
                 self.network.discovery.port.unwrap_or(DEFAULT_DISCOVERY_PORT),
             )))
-            .build(ShareableDatabase::new(db, self.chain.clone()))
+            .build(ProviderFactory::new(db, self.chain.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -691,13 +686,10 @@ impl Command {
                     ExecutionStageThresholds {
                         max_blocks: stage_conf.execution.max_blocks,
                         max_changes: stage_conf.execution.max_changes,
-                        max_changesets: stage_conf.execution.max_changesets,
                     },
-                ))
-                .disable_if(StageId::MerkleUnwind, || self.auto_mine)
-                .disable_if(StageId::MerkleExecute, || self.auto_mine),
+                )),
             )
-            .build(db);
+            .build(db, self.chain.clone());
 
         Ok(pipeline)
     }

@@ -6,12 +6,8 @@ use reth_primitives::{
     },
     BlockNumber,
 };
-use reth_provider::Transaction;
-use std::{
-    fmt::Debug,
-    ops::{Deref, RangeInclusive},
-};
-use tracing::*;
+use reth_provider::DatabaseProviderRW;
+use std::{fmt::Debug, ops::RangeInclusive};
 
 /// Stage is indexing history the account changesets generated in
 /// [`ExecutionStage`][crate::stages::ExecutionStage]. For more information
@@ -39,26 +35,31 @@ impl<DB: Database> Stage<DB> for IndexAccountHistoryStage {
     /// Execute the stage.
     async fn execute(
         &mut self,
-        tx: &mut Transaction<'_, DB>,
+        provider: &mut DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        let (range, is_final_range) = input.next_block_range_with_threshold(self.commit_threshold);
-
-        if range.is_empty() {
-            return Ok(ExecOutput::done(StageCheckpoint::new(*range.end())))
+        if input.target_reached() {
+            return Ok(ExecOutput::done(input.checkpoint()))
         }
 
-        let mut stage_checkpoint = stage_checkpoint(tx, input.checkpoint(), &range)?;
+        let (range, is_final_range) = input.next_block_range_with_threshold(self.commit_threshold);
 
-        let indices = tx.get_account_transition_ids_from_changeset(range.clone())?;
+        let mut stage_checkpoint = stage_checkpoint(
+            provider,
+            input.checkpoint(),
+            // It is important to provide the full block range into the checkpoint,
+            // not the one accounting for commit threshold, to get the correct range end.
+            &input.next_block_range(),
+        )?;
+
+        let indices = provider.get_account_transition_ids_from_changeset(range.clone())?;
         let changesets = indices.values().map(|blocks| blocks.len() as u64).sum::<u64>();
 
         // Insert changeset to history index
-        tx.insert_account_history_index(indices)?;
+        provider.insert_account_history_index(indices)?;
 
         stage_checkpoint.progress.processed += changesets;
 
-        info!(target: "sync::stages::index_account_history", stage_progress = *range.end(), is_final_range, "Stage iteration finished");
         Ok(ExecOutput {
             checkpoint: StageCheckpoint::new(*range.end())
                 .with_index_history_stage_checkpoint(stage_checkpoint),
@@ -69,13 +70,13 @@ impl<DB: Database> Stage<DB> for IndexAccountHistoryStage {
     /// Unwind the stage.
     async fn unwind(
         &mut self,
-        tx: &mut Transaction<'_, DB>,
+        provider: &mut DatabaseProviderRW<'_, &DB>,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        let (range, unwind_progress, is_final_range) =
+        let (range, unwind_progress, _) =
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
-        let changesets = tx.unwind_account_history_indices(range)?;
+        let changesets = provider.unwind_account_history_indices(range)?;
 
         let checkpoint =
             if let Some(mut stage_checkpoint) = input.checkpoint.index_history_stage_checkpoint() {
@@ -86,7 +87,6 @@ impl<DB: Database> Stage<DB> for IndexAccountHistoryStage {
                 StageCheckpoint::new(unwind_progress)
             };
 
-        info!(target: "sync::stages::index_account_history", to_block = input.unwind_to, unwind_progress, is_final_range, "Unwind iteration finished");
         // from HistoryIndex higher than that number.
         Ok(UnwindOutput { checkpoint })
     }
@@ -102,7 +102,7 @@ impl<DB: Database> Stage<DB> for IndexAccountHistoryStage {
 /// given block range and calculates the progress by counting the number of processed entries in the
 /// [tables::AccountChangeSet] table within the given block range.
 fn stage_checkpoint<DB: Database>(
-    tx: &Transaction<'_, DB>,
+    provider: &DatabaseProviderRW<'_, &DB>,
     checkpoint: StageCheckpoint,
     range: &RangeInclusive<BlockNumber>,
 ) -> Result<IndexHistoryCheckpoint, DatabaseError> {
@@ -119,18 +119,19 @@ fn stage_checkpoint<DB: Database>(
                 block_range: CheckpointBlockRange::from(range),
                 progress: EntitiesCheckpoint {
                     processed: progress.processed,
-                    total: tx.deref().entries::<tables::AccountChangeSet>()? as u64,
+                    total: provider.tx_ref().entries::<tables::AccountChangeSet>()? as u64,
                 },
             }
         }
         _ => IndexHistoryCheckpoint {
             block_range: CheckpointBlockRange::from(range),
             progress: EntitiesCheckpoint {
-                processed: tx
+                processed: provider
+                    .tx_ref()
                     .cursor_read::<tables::AccountChangeSet>()?
                     .walk_range(0..=checkpoint.block_number)?
                     .count() as u64,
-                total: tx.deref().entries::<tables::AccountChangeSet>()? as u64,
+                total: provider.tx_ref().entries::<tables::AccountChangeSet>()? as u64,
             },
         },
     })
@@ -139,10 +140,11 @@ fn stage_checkpoint<DB: Database>(
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use reth_provider::ProviderFactory;
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::test_utils::{TestTransaction, PREV_STAGE_ID};
+    use crate::test_utils::TestTransaction;
     use reth_db::{
         models::{
             sharded_key::NUM_OF_INDICES_IN_SHARD, AccountBeforeTx, ShardedKey,
@@ -152,7 +154,7 @@ mod tests {
         transaction::DbTxMut,
         BlockNumberList,
     };
-    use reth_primitives::{hex_literal::hex, H160};
+    use reth_primitives::{hex_literal::hex, H160, MAINNET};
 
     const ADDRESS: H160 = H160(hex!("0000000000000000000000000000000000000001"));
 
@@ -206,29 +208,24 @@ mod tests {
     }
 
     async fn run(tx: &TestTransaction, run_to: u64) {
-        let input = ExecInput {
-            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(run_to))),
-            ..Default::default()
-        };
+        let input = ExecInput { target: Some(run_to), ..Default::default() };
         let mut stage = IndexAccountHistoryStage::default();
-        let mut tx = tx.inner();
-        let out = stage.execute(&mut tx, input).await.unwrap();
+        let factory = ProviderFactory::new(tx.tx.as_ref(), MAINNET.clone());
+        let mut provider = factory.provider_rw().unwrap();
+        let out = stage.execute(&mut provider, input).await.unwrap();
         assert_eq!(
             out,
             ExecOutput {
                 checkpoint: StageCheckpoint::new(5).with_index_history_stage_checkpoint(
                     IndexHistoryCheckpoint {
-                        block_range: CheckpointBlockRange {
-                            from: input.checkpoint().block_number + 1,
-                            to: run_to
-                        },
+                        block_range: CheckpointBlockRange { from: input.next_block(), to: run_to },
                         progress: EntitiesCheckpoint { processed: 2, total: 2 }
                     }
                 ),
                 done: true
             }
         );
-        tx.commit().unwrap();
+        provider.commit().unwrap();
     }
 
     async fn unwind(tx: &TestTransaction, unwind_from: u64, unwind_to: u64) {
@@ -238,10 +235,11 @@ mod tests {
             ..Default::default()
         };
         let mut stage = IndexAccountHistoryStage::default();
-        let mut tx = tx.inner();
-        let out = stage.unwind(&mut tx, input).await.unwrap();
+        let factory = ProviderFactory::new(tx.tx.as_ref(), MAINNET.clone());
+        let mut provider = factory.provider_rw().unwrap();
+        let out = stage.unwind(&mut provider, input).await.unwrap();
         assert_eq!(out, UnwindOutput { checkpoint: StageCheckpoint::new(unwind_to) });
-        tx.commit().unwrap();
+        provider.commit().unwrap();
     }
 
     #[tokio::test]
@@ -440,6 +438,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stage_checkpoint_range() {
+        // init
+        let test_tx = TestTransaction::default();
+
+        // setup
+        partial_setup(&test_tx);
+
+        // run
+        {
+            let mut stage = IndexAccountHistoryStage { commit_threshold: 4 }; // Two runs required
+            let factory = ProviderFactory::new(&test_tx.tx, MAINNET.clone());
+            let mut provider = factory.provider_rw().unwrap();
+
+            let mut input = ExecInput { target: Some(5), ..Default::default() };
+            let out = stage.execute(&mut provider, input).await.unwrap();
+            assert_eq!(
+                out,
+                ExecOutput {
+                    checkpoint: StageCheckpoint::new(4).with_index_history_stage_checkpoint(
+                        IndexHistoryCheckpoint {
+                            block_range: CheckpointBlockRange { from: 1, to: 5 },
+                            progress: EntitiesCheckpoint { processed: 1, total: 2 }
+                        }
+                    ),
+                    done: false
+                }
+            );
+            input.checkpoint = Some(out.checkpoint);
+
+            let out = stage.execute(&mut provider, input).await.unwrap();
+            assert_eq!(
+                out,
+                ExecOutput {
+                    checkpoint: StageCheckpoint::new(5).with_index_history_stage_checkpoint(
+                        IndexHistoryCheckpoint {
+                            block_range: CheckpointBlockRange { from: 5, to: 5 },
+                            progress: EntitiesCheckpoint { processed: 2, total: 2 }
+                        }
+                    ),
+                    done: true
+                }
+            );
+
+            provider.commit().unwrap();
+        }
+
+        // verify
+        let table = cast(test_tx.table::<tables::AccountHistory>().unwrap());
+        assert_eq!(table, BTreeMap::from([(shard(u64::MAX), vec![4, 5])]));
+
+        // unwind
+        unwind(&test_tx, 5, 0).await;
+
+        // verify initial state
+        let table = test_tx.table::<tables::AccountHistory>().unwrap();
+        assert!(table.is_empty());
+    }
+
     #[test]
     fn stage_checkpoint_recalculation() {
         let tx = TestTransaction::default();
@@ -481,8 +538,11 @@ mod tests {
         })
         .unwrap();
 
+        let factory = ProviderFactory::new(tx.tx.as_ref(), MAINNET.clone());
+        let provider = factory.provider_rw().unwrap();
+
         assert_matches!(
-            stage_checkpoint(&tx.inner(), StageCheckpoint::new(1), &(1..=2)).unwrap(),
+            stage_checkpoint(&provider, StageCheckpoint::new(1), &(1..=2)).unwrap(),
             IndexHistoryCheckpoint {
                 block_range: CheckpointBlockRange { from: 1, to: 2 },
                 progress: EntitiesCheckpoint { processed: 2, total: 4 }

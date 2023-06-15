@@ -16,11 +16,11 @@ use reth_primitives::{
         StageId,
     },
 };
-use reth_provider::Transaction;
+use reth_provider::{AccountExtProvider, DatabaseProviderRW};
 use std::{
     cmp::max,
     fmt::Debug,
-    ops::{Deref, Range, RangeInclusive},
+    ops::{Range, RangeInclusive},
 };
 use tokio::sync::mpsc;
 use tracing::*;
@@ -79,7 +79,7 @@ impl AccountHashingStage {
     /// Proceeds to go to the `BlockTransitionIndex` end, go back `transitions` and change the
     /// account state in the `AccountChangeSet` table.
     pub fn seed<DB: Database>(
-        tx: &mut Transaction<'_, DB>,
+        provider: &mut DatabaseProviderRW<'_, DB>,
         opts: SeedOpts,
     ) -> Result<Vec<(reth_primitives::Address, reth_primitives::Account)>, StageError> {
         use reth_db::models::AccountBeforeTx;
@@ -92,18 +92,20 @@ impl AccountHashingStage {
         let blocks = random_block_range(opts.blocks.clone(), H256::zero(), opts.txs);
 
         for block in blocks {
-            insert_canonical_block(&**tx, block, None).unwrap();
+            insert_canonical_block(provider.tx_ref(), block, None).unwrap();
         }
         let mut accounts = random_eoa_account_range(opts.accounts);
         {
             // Account State generator
-            let mut account_cursor = tx.cursor_write::<tables::PlainAccountState>()?;
+            let mut account_cursor =
+                provider.tx_ref().cursor_write::<tables::PlainAccountState>()?;
             accounts.sort_by(|a, b| a.0.cmp(&b.0));
             for (addr, acc) in accounts.iter() {
                 account_cursor.append(*addr, *acc)?;
             }
 
-            let mut acc_changeset_cursor = tx.cursor_write::<tables::AccountChangeSet>()?;
+            let mut acc_changeset_cursor =
+                provider.tx_ref().cursor_write::<tables::AccountChangeSet>()?;
             for (t, (addr, acc)) in (opts.blocks).zip(&accounts) {
                 let Account { nonce, balance, .. } = acc;
                 let prev_acc = Account {
@@ -115,8 +117,6 @@ impl AccountHashingStage {
                 acc_changeset_cursor.append(t, acc_before_tx)?;
             }
         }
-
-        tx.commit()?;
 
         Ok(accounts)
     }
@@ -132,20 +132,21 @@ impl<DB: Database> Stage<DB> for AccountHashingStage {
     /// Execute the stage.
     async fn execute(
         &mut self,
-        tx: &mut Transaction<'_, DB>,
+        provider: &mut DatabaseProviderRW<'_, &DB>,
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
-        let range = input.next_block_range();
-        if range.is_empty() {
-            return Ok(ExecOutput::done(StageCheckpoint::new(*range.end())))
+        if input.target_reached() {
+            return Ok(ExecOutput::done(input.checkpoint()))
         }
-        let (from_block, to_block) = range.into_inner();
+
+        let (from_block, to_block) = input.next_block_range().into_inner();
 
         // if there are more blocks then threshold it is faster to go over Plain state and hash all
         // account otherwise take changesets aggregate the sets and apply hashing to
         // AccountHashing table. Also, if we start from genesis, we need to hash from scratch, as
         // genesis accounts are not in changeset.
         if to_block - from_block > self.clean_threshold || from_block == 1 {
+            let tx = provider.tx_ref();
             let stage_checkpoint = input
                 .checkpoint
                 .and_then(|checkpoint| checkpoint.account_hashing_stage_checkpoint());
@@ -231,56 +232,52 @@ impl<DB: Database> Stage<DB> for AccountHashingStage {
                     AccountHashingCheckpoint {
                         address: Some(next_address.key().unwrap()),
                         block_range: CheckpointBlockRange { from: from_block, to: to_block },
-                        progress: stage_checkpoint_progress(tx)?,
+                        progress: stage_checkpoint_progress(provider)?,
                     },
                 );
 
-                info!(target: "sync::stages::hashing_account", checkpoint = %checkpoint, is_final_range = false, "Stage iteration finished");
                 return Ok(ExecOutput { checkpoint, done: false })
             }
         } else {
             // Aggregate all transition changesets and make a list of accounts that have been
             // changed.
-            let lists = tx.get_addresses_of_changed_accounts(from_block..=to_block)?;
+            let lists = provider.changed_accounts_with_range(from_block..=to_block)?;
             // Iterate over plain state and get newest value.
             // Assumption we are okay to make is that plainstate represent
             // `previous_stage_progress` state.
-            let accounts = tx.get_plainstate_accounts(lists)?;
+            let accounts = provider.basic_accounts(lists)?;
             // Insert and hash accounts to hashing table
-            tx.insert_account_for_hashing(accounts.into_iter())?;
+            provider.insert_account_for_hashing(accounts.into_iter())?;
         }
 
         // We finished the hashing stage, no future iterations is expected for the same block range,
         // so no checkpoint is needed.
-        let checkpoint = input.previous_stage_checkpoint().with_account_hashing_stage_checkpoint(
-            AccountHashingCheckpoint {
-                progress: stage_checkpoint_progress(tx)?,
+        let checkpoint = StageCheckpoint::new(input.target())
+            .with_account_hashing_stage_checkpoint(AccountHashingCheckpoint {
+                progress: stage_checkpoint_progress(provider)?,
                 ..Default::default()
-            },
-        );
+            });
 
-        info!(target: "sync::stages::hashing_account", checkpoint = %checkpoint, is_final_range = true, "Stage iteration finished");
         Ok(ExecOutput { checkpoint, done: true })
     }
 
     /// Unwind the stage.
     async fn unwind(
         &mut self,
-        tx: &mut Transaction<'_, DB>,
+        provider: &mut DatabaseProviderRW<'_, &DB>,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        let (range, unwind_progress, is_final_range) =
+        let (range, unwind_progress, _) =
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
         // Aggregate all transition changesets and make a list of accounts that have been changed.
-        tx.unwind_account_hashing(range)?;
+        provider.unwind_account_hashing(range)?;
 
         let mut stage_checkpoint =
             input.checkpoint.account_hashing_stage_checkpoint().unwrap_or_default();
 
-        stage_checkpoint.progress = stage_checkpoint_progress(tx)?;
+        stage_checkpoint.progress = stage_checkpoint_progress(provider)?;
 
-        info!(target: "sync::stages::hashing_account", to_block = input.unwind_to, %unwind_progress, is_final_range, "Unwind iteration finished");
         Ok(UnwindOutput {
             checkpoint: StageCheckpoint::new(unwind_progress)
                 .with_account_hashing_stage_checkpoint(stage_checkpoint),
@@ -289,11 +286,11 @@ impl<DB: Database> Stage<DB> for AccountHashingStage {
 }
 
 fn stage_checkpoint_progress<DB: Database>(
-    tx: &Transaction<'_, DB>,
+    provider: &DatabaseProviderRW<'_, &DB>,
 ) -> Result<EntitiesCheckpoint, DatabaseError> {
     Ok(EntitiesCheckpoint {
-        processed: tx.deref().entries::<tables::HashedAccount>()? as u64,
-        total: tx.deref().entries::<tables::PlainAccountState>()? as u64,
+        processed: provider.tx_ref().entries::<tables::HashedAccount>()? as u64,
+        total: provider.tx_ref().entries::<tables::PlainAccountState>()? as u64,
     })
 }
 
@@ -302,7 +299,6 @@ mod tests {
     use super::*;
     use crate::test_utils::{
         stage_test_suite_ext, ExecuteStageTestRunner, TestRunnerError, UnwindStageTestRunner,
-        PREV_STAGE_ID,
     };
     use assert_matches::assert_matches;
     use reth_primitives::{stage::StageUnitCheckpoint, Account, U256};
@@ -318,7 +314,7 @@ mod tests {
         runner.set_clean_threshold(1);
 
         let input = ExecInput {
-            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(previous_stage))),
+            target: Some(previous_stage),
             checkpoint: Some(StageCheckpoint::new(stage_progress)),
         };
 
@@ -359,7 +355,7 @@ mod tests {
         runner.set_commit_threshold(5);
 
         let mut input = ExecInput {
-            previous_stage: Some((PREV_STAGE_ID, StageCheckpoint::new(previous_stage))),
+            target: Some(previous_stage),
             checkpoint: Some(StageCheckpoint::new(stage_progress)),
         };
 
@@ -536,15 +532,14 @@ mod tests {
             type Seed = Vec<(Address, Account)>;
 
             fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
-                Ok(AccountHashingStage::seed(
-                    &mut self.tx.inner(),
-                    SeedOpts {
-                        blocks: 1..=input.previous_stage_checkpoint().block_number,
-                        accounts: 0..10,
-                        txs: 0..3,
-                    },
+                let mut provider = self.tx.inner();
+                let res = Ok(AccountHashingStage::seed(
+                    &mut provider,
+                    SeedOpts { blocks: 1..=input.target(), accounts: 0..10, txs: 0..3 },
                 )
-                .unwrap())
+                .unwrap());
+                provider.commit().expect("failed to commit");
+                res
             }
 
             fn validate_execution(
@@ -553,7 +548,7 @@ mod tests {
                 output: Option<ExecOutput>,
             ) -> Result<(), TestRunnerError> {
                 if let Some(output) = output {
-                    let start_block = input.checkpoint().block_number + 1;
+                    let start_block = input.next_block();
                     let end_block = output.checkpoint.block_number;
                     if start_block > end_block {
                         return Ok(())
