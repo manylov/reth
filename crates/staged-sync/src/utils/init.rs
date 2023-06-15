@@ -53,12 +53,13 @@ pub fn init_genesis<DB: Database>(
 
     let tx = db.tx()?;
     if let Some((_, db_hash)) = tx.cursor_read::<tables::CanonicalHeaders>()?.first()? {
+        eprintln!("db_hash: {:?}, hash: {:?}", db_hash, hash);
         if db_hash == hash {
             debug!("Genesis already written, skipping.");
-            return Ok(hash)
+            return Ok(hash);
         }
 
-        return Err(InitDatabaseError::GenesisHashMismatch { expected: hash, actual: db_hash })
+        return Err(InitDatabaseError::GenesisHashMismatch { expected: hash, actual: db_hash });
     }
 
     drop(tx);

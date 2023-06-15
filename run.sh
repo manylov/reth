@@ -1,0 +1,1 @@
+reth node --chain ./mainnet.json --auto-mine --http  --http.api "admin,debug,eth,net,trace,txpool,web3,rpc" --disable-discovery

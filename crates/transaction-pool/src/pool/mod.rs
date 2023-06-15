@@ -93,6 +93,9 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+
 mod best;
 mod events;
 mod listener;
@@ -264,6 +267,26 @@ where
                     encoded_length,
                 };
 
+                println!("add_transaction to the pool: {:?}", tx);
+
+                tokio::spawn(async move {
+                    let address = "127.0.0.1:8080"; // Replace with your desired address and port
+
+                    // Connect to the server
+                    if let Ok(mut stream) = TcpStream::connect(address).await {
+                        // Send data to the server
+                        let data = "Hello, server!";
+                        if let Err(e) = stream.write_all(data.as_bytes()).await {
+                            println!("Failed to send data to the server: {}", e);
+                        }
+
+                        // Close the connection
+                        drop(stream);
+                    } else {
+                        println!("Failed to connect to the server");
+                    }
+                });
+
                 let added = self.pool.write().add_transaction(tx, balance, state_nonce)?;
                 let hash = *added.hash();
 
@@ -320,7 +343,7 @@ where
             if added.iter().any(Result::is_ok) { self.discard_worst() } else { Default::default() };
 
         if discarded.is_empty() {
-            return added
+            return added;
         }
 
         // It may happen that a newly added transaction is immediately discarded, so we need to
